@@ -1,4 +1,4 @@
-import os
+import json
 import uuid
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
@@ -6,9 +6,9 @@ from zoneinfo import ZoneInfo
 from google.cloud import bigquery
 from google_play_scraper import reviews, Sort
 
-# -----------------------------
+# ============================
 # CONFIG
-# -----------------------------
+# ============================
 PROJECT_ID = "valid-cedar-485813-v7"
 DATASET_ID = "reviews"
 TABLE_ID = "raw_reviews"
@@ -20,25 +20,9 @@ APPS = {
 
 IST = ZoneInfo("Asia/Kolkata")
 
-# -----------------------------
-# JSON SAFE CONVERTER (CRITICAL)
-# -----------------------------
-def json_safe(obj):
-    """
-    Recursively convert datetime objects into ISO strings.
-    This guarantees BigQuery insert_rows_json will NEVER fail.
-    """
-    if isinstance(obj, datetime):
-        return obj.isoformat()
-    if isinstance(obj, dict):
-        return {k: json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [json_safe(v) for v in obj]
-    return obj
-
-# -----------------------------
+# ============================
 # DATE WINDOW (D-1 IST)
-# -----------------------------
+# ============================
 today_ist = datetime.now(IST).date()
 d1 = today_ist - timedelta(days=1)
 
@@ -47,15 +31,15 @@ end_dt = datetime.combine(d1, time.max).replace(tzinfo=IST)
 
 print(f"📅 Fetching reviews from {start_dt} to {end_dt} (IST)")
 
-# -----------------------------
+# ============================
 # BIGQUERY CLIENT
-# -----------------------------
+# ============================
 bq_client = bigquery.Client(project=PROJECT_ID)
 table_ref = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
 
-# -----------------------------
+# ============================
 # SCRAPING
-# -----------------------------
+# ============================
 rows = []
 
 for app_id, app_name in APPS.items():
@@ -72,7 +56,7 @@ for app_id, app_name in APPS.items():
     for r in result:
         at = r.get("at")
 
-        # Handle datetime safely (google_play_scraper may return datetime OR string)
+        # ---- SAFE datetime handling ----
         if isinstance(at, datetime):
             review_dt = at.astimezone(IST)
         else:
@@ -84,6 +68,13 @@ for app_id, app_name in APPS.items():
         if not (start_dt <= review_dt <= end_dt):
             continue
 
+        reply_at = r.get("replyAt")
+        reply_date = (
+            reply_at.astimezone(IST).isoformat()
+            if isinstance(reply_at, datetime)
+            else None
+        )
+
         row = {
             "review_id": r.get("reviewId") or str(uuid.uuid4()),
             "app_name": app_name,
@@ -93,11 +84,7 @@ for app_id, app_name in APPS.items():
             "user_name": r.get("userName"),
             "thumbs_up": int(r.get("thumbsUpCount", 0)),
             "reply_text": r.get("replyContent"),
-            "reply_date": (
-                r["replyAt"].astimezone(IST).isoformat()
-                if isinstance(r.get("replyAt"), datetime)
-                else None
-            ),
+            "reply_date": reply_date,
             "inserted_on": datetime.now(IST).isoformat(),
         }
 
@@ -105,16 +92,17 @@ for app_id, app_name in APPS.items():
 
 print(f"✅ Total D-1 reviews collected: {len(rows)}")
 
-# -----------------------------
-# BIGQUERY INSERT
-# -----------------------------
+# ============================
+# HARD JSON SANITIZATION (KEY FIX)
+# ============================
 if rows:
-    safe_rows = json_safe(rows)
+    # 🔒 This guarantees ZERO datetime objects survive
+    safe_rows = json.loads(json.dumps(rows))
 
     errors = bq_client.insert_rows_json(
         table_ref,
         safe_rows,
-        row_ids=[r["review_id"] for r in safe_rows],  # idempotent-friendly
+        row_ids=[r["review_id"] for r in safe_rows],
     )
 
     if errors:
