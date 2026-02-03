@@ -1,39 +1,38 @@
 import os
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from dateutil import parser
+
 from google.cloud import bigquery
 from google_play_scraper import reviews, Sort
 
-# ---------------- CONFIG ----------------
+IST = ZoneInfo("Asia/Kolkata")
+
 PROJECT_ID = "valid-cedar-485813-v7"
 DATASET_ID = "reviews"
 TABLE_ID = "raw_reviews"
 
 APPS = {
-    "com.naviapp": "Navi",
-    "com.fastmoney.loan": "FastMoney"
+    "Navi": "com.naviapp",
+    "FastMoney": "com.fastmoney.loan",
 }
 
-IST = ZoneInfo("Asia/Kolkata")
-
-# ---------------- DATE RANGE (D-1) ----------------
+# -----------------------------
+# 1. Date window (D-1 IST)
+# -----------------------------
 today_ist = datetime.now(IST).date()
 d1 = today_ist - timedelta(days=1)
 
-START_DT = datetime.combine(d1, time.min, IST)
-END_DT = datetime.combine(d1, time.max, IST)
+start_dt = datetime.combine(d1, datetime.min.time(), IST)
+end_dt = datetime.combine(d1, datetime.max.time(), IST)
 
-print(f"📅 Fetching reviews from {START_DT} to {END_DT} (IST)")
+print(f"📅 Fetching reviews from {start_dt} to {end_dt} (IST)")
 
-# ---------------- BIGQUERY CLIENT ----------------
-bq_client = bigquery.Client(project=PROJECT_ID)
-table_ref = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+# -----------------------------
+# 2. Fetch reviews
+# -----------------------------
+rows = []
 
-rows_to_insert = []
-
-# ---------------- SCRAPING ----------------
-for app_id, app_name in APPS.items():
+for app_name, app_id in APPS.items():
     print(f"📦 Scraping {app_id}")
 
     result, _ = reviews(
@@ -41,45 +40,50 @@ for app_id, app_name in APPS.items():
         lang="en",
         country="in",
         sort=Sort.NEWEST,
-        count=1000
+        count=1000,
     )
 
     for r in result:
-        raw_dt = r.get("at")
+        review_dt = r["at"]
 
-        # Handle both datetime and string safely
-        if isinstance(raw_dt, datetime):
-            review_dt = raw_dt.astimezone(IST)
+        # Ensure timezone-aware
+        if review_dt.tzinfo is None:
+            review_dt = review_dt.replace(tzinfo=IST)
         else:
-            review_dt = parser.isoparse(str(raw_dt)).astimezone(IST)
+            review_dt = review_dt.astimezone(IST)
 
-        if not (START_DT <= review_dt <= END_DT):
+        if not (start_dt <= review_dt <= end_dt):
             continue
 
-        rows_to_insert.append({
-            "review_id": r.get("reviewId"),
+        row = {
+            "review_id": str(r["reviewId"]),
             "app_name": app_name,
-            "review_date": review_dt.isoformat(),          # ✅ STRING
-            "rating": int(r.get("score", 0)),
+            "review_date": review_dt.isoformat(),  # ✅ STRING
+            "rating": int(r["score"]),
             "review_text": r.get("content", ""),
-            "inserted_on": datetime.now(IST).isoformat()   # ✅ STRING
-        })
+            "inserted_on": datetime.now(IST).isoformat(),  # ✅ STRING
+        }
 
-print(f"✅ Total D-1 reviews collected: {len(rows_to_insert)}")
+        rows.append(row)
 
-# ---------------- BIGQUERY INSERT ----------------
-if rows_to_insert:
-    errors = bq_client.insert_rows_json(
-        table_ref,
-        rows_to_insert,
-        row_ids=[r["review_id"] for r in rows_to_insert]
-    )
+print(f"✅ Total D-1 reviews collected: {len(rows)}")
 
-    if errors:
-        print("❌ BigQuery insert errors:")
-        for e in errors:
-            print(e)
-    else:
-        print("🎉 Successfully inserted rows into BigQuery")
-else:
-    print("⚠️ No reviews found for D-1")
+if not rows:
+    print("⚠️ No rows to insert. Exiting.")
+    exit(0)
+
+# -----------------------------
+# 3. Insert into BigQuery
+# -----------------------------
+bq_client = bigquery.Client(project=PROJECT_ID)
+table_ref = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+
+errors = bq_client.insert_rows_json(table_ref, rows)
+
+if errors:
+    print("❌ BigQuery insertion errors:")
+    for e in errors:
+        print(e)
+    raise RuntimeError("BigQuery insert failed")
+
+print("🎉 Successfully inserted rows into BigQuery")
