@@ -1,103 +1,120 @@
+import os
 import json
 import uuid
-from datetime import datetime, timedelta, time
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta
+from dateutil import parser
+import pytz
 
 from google.cloud import bigquery
 from google_play_scraper import reviews, Sort
 
-# ============================
+
+# ─────────────────────────────────────────────────────────────
 # CONFIG
-# ============================
+# ─────────────────────────────────────────────────────────────
 PROJECT_ID = "valid-cedar-485813-v7"
 DATASET_ID = "reviews"
 TABLE_ID = "raw_reviews"
 
-APPS = {
-    "com.naviapp": "Navi",
-    "com.fastmoney.loan": "FastMoney",
-}
+APP_IDS = [
+    "com.naviapp",
+    "com.fastmoney.loan",
+]
 
-IST = ZoneInfo("Asia/Kolkata")
+IST = pytz.timezone("Asia/Kolkata")
 
-# ============================
-# DATE WINDOW (D-1 IST)
-# ============================
-today_ist = datetime.now(IST).date()
-d1 = today_ist - timedelta(days=1)
 
-start_dt = datetime.combine(d1, time.min).replace(tzinfo=IST)
-end_dt = datetime.combine(d1, time.max).replace(tzinfo=IST)
+# ─────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────
+def to_iso(val):
+    """Convert datetime → ISO string, leave others untouched"""
+    if isinstance(val, datetime):
+        return val.isoformat()
+    return val
 
-print(f"📅 Fetching reviews from {start_dt} to {end_dt} (IST)")
 
-# ============================
-# BIGQUERY CLIENT
-# ============================
-bq_client = bigquery.Client(project=PROJECT_ID)
-table_ref = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+def parse_datetime(val):
+    """
+    google-play-scraper may return:
+    - datetime
+    - ISO string
+    - None
+    """
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.astimezone(IST)
+    return parser.isoparse(str(val)).astimezone(IST)
 
-# ============================
-# SCRAPING
-# ============================
-rows = []
 
-for app_id, app_name in APPS.items():
-    print(f"📦 Scraping {app_id}")
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
 
-    result, _ = reviews(
-        app_id,
-        lang="en",
-        country="in",
-        sort=Sort.NEWEST,
-        count=1000,
+    # ── D-1 window (IST)
+    today_ist = datetime.now(IST).date()
+    d1 = today_ist - timedelta(days=1)
+
+    start_dt = IST.localize(datetime.combine(d1, datetime.min.time()))
+    end_dt = IST.localize(datetime.combine(d1, datetime.max.time()))
+
+    print(
+        f"📅 Fetching reviews from {start_dt} to {end_dt} (IST)",
+        flush=True,
     )
 
-    for r in result:
-        at = r.get("at")
+    all_rows = []
 
-        # ---- SAFE datetime handling ----
-        if isinstance(at, datetime):
-            review_dt = at.astimezone(IST)
-        else:
-            try:
-                review_dt = datetime.fromisoformat(str(at)).astimezone(IST)
-            except Exception:
-                continue
+    # ── Scrape apps
+    for app_id in APP_IDS:
+        print(f"📦 Scraping {app_id}", flush=True)
 
-        if not (start_dt <= review_dt <= end_dt):
-            continue
-
-        reply_at = r.get("replyAt")
-        reply_date = (
-            reply_at.astimezone(IST).isoformat()
-            if isinstance(reply_at, datetime)
-            else None
+        result, _ = reviews(
+            app_id,
+            lang="en",
+            country="in",
+            sort=Sort.NEWEST,
+            count=1000,
         )
 
-        row = {
-            "review_id": r.get("reviewId") or str(uuid.uuid4()),
-            "app_name": app_name,
-            "review_date": review_dt.isoformat(),
-            "rating": int(r.get("score", 0)),
-            "review_text": r.get("content", ""),
-            "user_name": r.get("userName"),
-            "thumbs_up": int(r.get("thumbsUpCount", 0)),
-            "reply_text": r.get("replyContent"),
-            "reply_date": reply_date,
-            "inserted_on": datetime.now(IST).isoformat(),
-        }
+        for r in result:
+            review_dt = parse_datetime(r.get("at"))
+            if not review_dt:
+                continue
 
-        rows.append(row)
+            if not (start_dt <= review_dt <= end_dt):
+                continue
 
-print(f"✅ Total D-1 reviews collected: {len(rows)}")
+            reply_dt = parse_datetime(r.get("repliedAt"))
 
-# ============================
-# HARD JSON SANITIZATION (KEY FIX)
-# ============================
-if rows:
-    # 🔒 This guarantees ZERO datetime objects survive
-    safe_rows = json.loads(json.dumps(rows))
+            row = {
+                "review_id": r.get("reviewId") or str(uuid.uuid4()),
+                "app_name": app_id,
+                "review_date": to_iso(review_dt),
+                "rating": int(r.get("score") or 0),
+                "review_text": r.get("content") or "",
+                "inserted_on": datetime.now(IST).isoformat(),
+            }
+
+            all_rows.append(row)
+
+    print(f"✅ Total D-1 reviews collected: {len(all_rows)}", flush=True)
+
+    if not all_rows:
+        print("⚠️ No reviews to insert. Exiting.", flush=True)
+        exit(0)
+
+    # ─────────────────────────────────────────────────────────────
+    # BIGQUERY INSERT (SAFE)
+    # ─────────────────────────────────────────────────────────────
+    bq_client = bigquery.Client(project=PROJECT_ID)
+
+    table_ref = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+
+    # 🔥 HARD JSON SANITIZATION (CRITICAL FIX)
+    safe_rows = json.loads(json.dumps(all_rows))
 
     errors = bq_client.insert_rows_json(
         table_ref,
@@ -106,11 +123,8 @@ if rows:
     )
 
     if errors:
-        print("❌ BigQuery insert errors:")
-        for e in errors:
-            print(e)
+        print("❌ BigQuery insertion errors:")
+        print(errors)
         raise RuntimeError("BigQuery insert failed")
-    else:
-        print("🎉 Successfully inserted rows into BigQuery")
-else:
-    print("⚠️ No reviews found for D-1")
+
+    print(f"🎯 Successfully inserted {len(safe_rows)} rows into {table_ref}", flush=True)
