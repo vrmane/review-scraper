@@ -1,38 +1,64 @@
 import os
-from datetime import datetime, timedelta
+import uuid
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
 from google.cloud import bigquery
 from google_play_scraper import reviews, Sort
 
-IST = ZoneInfo("Asia/Kolkata")
-
+# -----------------------------
+# CONFIG
+# -----------------------------
 PROJECT_ID = "valid-cedar-485813-v7"
 DATASET_ID = "reviews"
 TABLE_ID = "raw_reviews"
 
 APPS = {
-    "Navi": "com.naviapp",
-    "FastMoney": "com.fastmoney.loan",
+    "com.naviapp": "Navi",
+    "com.fastmoney.loan": "FastMoney",
 }
 
+IST = ZoneInfo("Asia/Kolkata")
+
 # -----------------------------
-# 1. Date window (D-1 IST)
+# JSON SAFE CONVERTER (CRITICAL)
+# -----------------------------
+def json_safe(obj):
+    """
+    Recursively convert datetime objects into ISO strings.
+    This guarantees BigQuery insert_rows_json will NEVER fail.
+    """
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {k: json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [json_safe(v) for v in obj]
+    return obj
+
+# -----------------------------
+# DATE WINDOW (D-1 IST)
 # -----------------------------
 today_ist = datetime.now(IST).date()
 d1 = today_ist - timedelta(days=1)
 
-start_dt = datetime.combine(d1, datetime.min.time(), IST)
-end_dt = datetime.combine(d1, datetime.max.time(), IST)
+start_dt = datetime.combine(d1, time.min).replace(tzinfo=IST)
+end_dt = datetime.combine(d1, time.max).replace(tzinfo=IST)
 
 print(f"📅 Fetching reviews from {start_dt} to {end_dt} (IST)")
 
 # -----------------------------
-# 2. Fetch reviews
+# BIGQUERY CLIENT
+# -----------------------------
+bq_client = bigquery.Client(project=PROJECT_ID)
+table_ref = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+
+# -----------------------------
+# SCRAPING
 # -----------------------------
 rows = []
 
-for app_name, app_id in APPS.items():
+for app_id, app_name in APPS.items():
     print(f"📦 Scraping {app_id}")
 
     result, _ = reviews(
@@ -44,46 +70,59 @@ for app_name, app_id in APPS.items():
     )
 
     for r in result:
-        review_dt = r["at"]
+        at = r.get("at")
 
-        # Ensure timezone-aware
-        if review_dt.tzinfo is None:
-            review_dt = review_dt.replace(tzinfo=IST)
+        # Handle datetime safely (google_play_scraper may return datetime OR string)
+        if isinstance(at, datetime):
+            review_dt = at.astimezone(IST)
         else:
-            review_dt = review_dt.astimezone(IST)
+            try:
+                review_dt = datetime.fromisoformat(str(at)).astimezone(IST)
+            except Exception:
+                continue
 
         if not (start_dt <= review_dt <= end_dt):
             continue
 
         row = {
-            "review_id": str(r["reviewId"]),
+            "review_id": r.get("reviewId") or str(uuid.uuid4()),
             "app_name": app_name,
-            "review_date": review_dt.isoformat(),  # ✅ STRING
-            "rating": int(r["score"]),
+            "review_date": review_dt.isoformat(),
+            "rating": int(r.get("score", 0)),
             "review_text": r.get("content", ""),
-            "inserted_on": datetime.now(IST).isoformat(),  # ✅ STRING
+            "user_name": r.get("userName"),
+            "thumbs_up": int(r.get("thumbsUpCount", 0)),
+            "reply_text": r.get("replyContent"),
+            "reply_date": (
+                r["replyAt"].astimezone(IST).isoformat()
+                if isinstance(r.get("replyAt"), datetime)
+                else None
+            ),
+            "inserted_on": datetime.now(IST).isoformat(),
         }
 
         rows.append(row)
 
 print(f"✅ Total D-1 reviews collected: {len(rows)}")
 
-if not rows:
-    print("⚠️ No rows to insert. Exiting.")
-    exit(0)
-
 # -----------------------------
-# 3. Insert into BigQuery
+# BIGQUERY INSERT
 # -----------------------------
-bq_client = bigquery.Client(project=PROJECT_ID)
-table_ref = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+if rows:
+    safe_rows = json_safe(rows)
 
-errors = bq_client.insert_rows_json(table_ref, rows)
+    errors = bq_client.insert_rows_json(
+        table_ref,
+        safe_rows,
+        row_ids=[r["review_id"] for r in safe_rows],  # idempotent-friendly
+    )
 
-if errors:
-    print("❌ BigQuery insertion errors:")
-    for e in errors:
-        print(e)
-    raise RuntimeError("BigQuery insert failed")
-
-print("🎉 Successfully inserted rows into BigQuery")
+    if errors:
+        print("❌ BigQuery insert errors:")
+        for e in errors:
+            print(e)
+        raise RuntimeError("BigQuery insert failed")
+    else:
+        print("🎉 Successfully inserted rows into BigQuery")
+else:
+    print("⚠️ No reviews found for D-1")
